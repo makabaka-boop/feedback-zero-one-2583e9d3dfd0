@@ -7,6 +7,13 @@ Small trees only, with expectations derived independently of the backend:
     with per-edge expected jump counts from Simpson-rule numerical
     integration of the endpoint-conditioned jump intensity,
   * rejection / output-file-preservation checks,
+  * short-branch regressions with independent analytic expectations
+    (t*coth(t) jump counts): 1e-20/1e-13 branches stay observable,
+    ancestor-edge counts are not distorted, missing data, rate mixtures,
+    and genuine zeros (impossible vs unobservable vs empty sites), plus
+    a 1e-9-branch 3-leaf tree cross-checked against enumeration +
+    Simpson quadrature, and the shared inference chain via the
+    sequences entry,
   * for the alignment import (sequences) entry: independent enumeration of
     all short-string alignments (joint 3/4-leaf optima, ties, empty
     strings, a double-gap-column case that discriminates the
@@ -578,6 +585,202 @@ def test_output_replaced_on_success():
 
 
 # ---------------------------------------------------------------------------
+# Short-branch regression tests (independent analytic expectations)
+# ---------------------------------------------------------------------------
+#
+# On the symmetric unit-rate chain (Q = [[-1, 1], [1, -1]], pi = [1/2, 1/2])
+# with u = exp(-2 t):
+#   P_01(t) = (1 - u)/2,  J_01(t) = t (1 + u)/2,
+#   E[N | X_t != X_0] = J_01/P_01 = t (1 + u)/(1 - u) = t coth(t) -> 1
+# as t -> 0.  A branch of length 1e-20 / 1e-13 must stay observable and
+# must not distort the counts on ancestor edges.
+
+TINY20 = "1/100000000000000000000"          # 1e-20
+TINY13 = "1/10000000000000"                 # 1e-13
+
+
+def t_coth(t):
+    """t*coth(t), stably computed for tiny t (via expm1)."""
+    return t * (2.0 + math.expm1(2.0 * t)) / math.expm1(2.0 * t)
+
+
+def tiny2_payload(sites, rates=None):
+    return example_payload(sites,
+                           edges=[["R", "a", "0/1"], ["R", "b", TINY20]],
+                           rates=rates)
+
+
+def test_short_branch_observable():
+    """1e-20 branch, site a=A b=C: P(V) = P01 ~ 1e-20 > 0, so NOT
+    unobservable.  P(E and V) = pi_A * P01 = P01/2, likelihood = 1/2,
+    counts = [0, J01/P01] = [0, t*coth(t)] = [0, 1] to 1e-8."""
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(tiny2_payload([{"a": "A", "b": "C"}]), d)
+        res = json.loads(out) if proc.returncode == 0 else None
+        ok = (proc.returncode == 0 and isinstance(res, list) and len(res) == 1
+              and abs(res[0]["likelihood"] - 0.5) <= 1e-8
+              and res[0]["counts"][0] == 0.0
+              and abs(res[0]["counts"][1] - t_coth(1e-20)) <= 1e-8
+              and abs(res[0]["counts"][1] - 1.0) <= 1e-8)
+        check("short_branch: 1e-20 branch observable, likelihood=1/2, "
+              "counts=[0, t*coth(t)]", ok, out)
+
+
+def test_ancestor_counts_short_branch():
+    """Edges R->u (t=1), u->a (t=0), u->b (t=1e-13); both leaves '?'.
+    V = {state at u != state at b} and P(V | X_u) is the same for both
+    states at u, so conditioning on V leaves the ancestor edge
+    undistorted: counts[0] = E[N on a unit-rate t=1 edge] = 1 exactly;
+    counts[1] = 0 (zero length); counts[2] = t*coth(t) ~ 1."""
+    edges = [["R", "u", "1/1"], ["u", "a", "0/1"], ["u", "b", TINY13]]
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(example_payload([{"a": "?", "b": "?"}],
+                                                edges=edges), d)
+        res = json.loads(out) if proc.returncode == 0 else None
+        ok = (proc.returncode == 0 and isinstance(res, list) and len(res) == 1
+              and abs(res[0]["likelihood"] - 1.0) <= 1e-8
+              and abs(res[0]["counts"][0] - 1.0) <= 1e-8
+              and res[0]["counts"][1] == 0.0
+              and abs(res[0]["counts"][2] - t_coth(1e-13)) <= 1e-8
+              and abs(res[0]["counts"][2] - 1.0) <= 1e-8)
+        check("ancestor_counts: likelihood=1, counts=[1, 0, t*coth(t)]",
+              ok, out)
+
+
+def test_short_branch_missing_data():
+    """Missing data on the 1e-20 tree.  a=A, b=?: E and V still requires
+    root=A and b truly C, so the fully observed numbers carry over
+    (likelihood 1/2, counts [0, t*coth(t)]).  a=?, b=?: E is certain, so
+    likelihood = 1 and counts = [0, t*coth(t)]."""
+    cases = [({"a": "A", "b": "?"}, 0.5), ({"a": "?", "b": "?"}, 1.0)]
+    for site, want_like in cases:
+        with tempfile.TemporaryDirectory() as d:
+            proc, out = run_backend(tiny2_payload([site]), d)
+            res = json.loads(out) if proc.returncode == 0 else None
+            ok = (proc.returncode == 0 and isinstance(res, list)
+                  and abs(res[0]["likelihood"] - want_like) <= 1e-8
+                  and res[0]["counts"][0] == 0.0
+                  and abs(res[0]["counts"][1] - t_coth(1e-20)) <= 1e-8)
+            check("short_branch_missing(%s): likelihood=%g, counts=[0, "
+                  "t*coth(t)]" % ("/".join(site[l] for l in ("a", "b")),
+                                  want_like), ok, out)
+
+
+def test_short_branch_rate_mixture():
+    """rates [[0, 1/2], [1, 1/2]] on the 1e-20 tree, site a=A b=C.  The
+    zero rate contributes 0 to both P(E and V) and P(V); mixing the
+    joint probabilities first and conditioning afterwards gives
+    likelihood = (0.5 * P01/2) / (0.5 * P01) = 1/2 and counts
+    [0, (0.5 * J01/2)/(0.5 * P01/2)] = [0, t*coth(t)]."""
+    with tempfile.TemporaryDirectory() as d:
+        payload = tiny2_payload([{"a": "A", "b": "C"}],
+                                rates=[["0/1", "1/2"], ["1/1", "1/2"]])
+        proc, out = run_backend(payload, d)
+        res = json.loads(out) if proc.returncode == 0 else None
+        ok = (proc.returncode == 0 and isinstance(res, list)
+              and abs(res[0]["likelihood"] - 0.5) <= 1e-8
+              and res[0]["counts"][0] == 0.0
+              and abs(res[0]["counts"][1] - t_coth(1e-20)) <= 1e-8)
+        check("short_branch_mixture: mix then condition on a 1e-20 branch",
+              ok, out)
+
+
+def test_short_branch_true_zero():
+    """Genuine zeros on the 1e-20 tree: P(V) > 0 but P(E and V) = 0 for
+    the constant site a=A b=A (observations pin both leaves, V cannot
+    hold) -> {"status": "impossible"}, NOT unobservable; a zero rate
+    makes P(V) exactly 0 -> {"status": "unobservable"}; valid empty
+    sites still take precedence with []."""
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(tiny2_payload([{"a": "A", "b": "A"}]), d)
+        ok = (proc.returncode == 0
+              and json.loads(out) == [{"status": "impossible"}])
+        check("short_branch_zero: constant site is impossible, not "
+              "unobservable", ok, out)
+    with tempfile.TemporaryDirectory() as d:
+        payload = tiny2_payload([{"a": "A", "b": "C"}],
+                                rates=[["0/1", "1/1"]])
+        proc, out = run_backend(payload, d)
+        ok = (proc.returncode == 0
+              and json.loads(out) == {"status": "unobservable"})
+        check("short_branch_zero: zero rate is unobservable", ok, out)
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(tiny2_payload([]), d)
+        ok = proc.returncode == 0 and json.loads(out) == []
+        check("short_branch_zero: empty sites take precedence", ok, out)
+
+
+def test_short_branch_brute_force():
+    """Three-leaf tree with a 1e-9 branch and a rate mixture, checked
+    against independent enumeration over all node-state assignments with
+    Simpson-rule jump counts (reference accurate to ~1e-10 here)."""
+    nodes = ["R", "u", "a", "b", "c"]
+    root = "R"
+    edges_f = [("R", "u", 0.4), ("u", "a", 1e-9), ("u", "b", 0.3),
+               ("R", "c", 0.7)]
+    leaves = ["a", "b", "c"]
+    pi = [0.4, 0.6]
+    a_q, b_q = 3.0, 2.0
+    rates = [(0.5, 1.0 / 3.0), (1.5, 2.0 / 3.0)]
+    sites = [{"a": "C", "b": "A", "c": "A"},   # signal rides the 1e-9 edge
+             {"a": "?", "b": "?", "c": "?"},
+             {"a": "A", "b": "C", "c": "?"}]
+    payload = {
+        "edges": [["R", "u", "2/5"], ["u", "a", "1/1000000000"],
+                  ["u", "b", "3/10"], ["R", "c", "7/10"]],
+        "pi": ["2/5", "3/5"],
+        "Q": [["-3/1", "3/1"], ["2/1", "-2/1"]],
+        "rates": [["1/2", "1/3"], ["3/2", "2/3"]],
+        "sites": sites,
+    }
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(payload, d)
+        if proc.returncode != 0:
+            check("short_branch_brute_force: exit 0", False, proc.stdout)
+            return
+        res = json.loads(out)
+        ok_all = True
+        detail = ""
+        for k, site in enumerate(sites):
+            like, counts = brute_force(nodes, root, edges_f, leaves, pi,
+                                       a_q, b_q, rates, site)
+            got = res[k]
+            if abs(got["likelihood"] - like) > 1e-6:
+                ok_all = False
+                detail = "site %d likelihood %r vs %r" % (k,
+                                                          got["likelihood"],
+                                                          like)
+            for e in range(len(edges_f)):
+                if abs(got["counts"][e] - counts[e]) > 1e-6:
+                    ok_all = False
+                    detail = ("site %d edge %d count %r vs %r"
+                              % (k, e, got["counts"][e], counts[e]))
+        check("short_branch_brute_force: 1e-9 edge + mixture matches "
+              "enumeration + quadrature", ok_all, detail or out)
+
+
+def test_align_short_branch():
+    """The sequences entry shares the fixed inference chain: aligning
+    a=A with b=C on the 1e-20 tree yields one column whose result is the
+    analytic short-branch one (likelihood 1/2, counts [0, t*coth(t)])."""
+    with tempfile.TemporaryDirectory() as d:
+        payload = sequences_payload({"a": "A", "b": "C"},
+                                    edges=[["R", "a", "0/1"],
+                                           ["R", "b", TINY20]])
+        proc, out = run_backend(payload, d)
+        res = json.loads(out) if proc.returncode == 0 else {}
+        ok = (proc.returncode == 0
+              and set(res) == {"alignment", "result"}
+              and res["alignment"] == {"a": "A", "b": "C"}
+              and isinstance(res["result"], list) and len(res["result"]) == 1
+              and abs(res["result"][0]["likelihood"] - 0.5) <= 1e-8
+              and res["result"][0]["counts"][0] == 0.0
+              and abs(res["result"][0]["counts"][1] - t_coth(1e-20)) <= 1e-8)
+        check("align_short_branch: sequences entry shares the fixed "
+              "inference chain", ok, out)
+
+
+# ---------------------------------------------------------------------------
 # Alignment import entry (sequences) tests
 # ---------------------------------------------------------------------------
 
@@ -900,6 +1103,13 @@ def main():
         test_site_order,
         test_rejections,
         test_output_replaced_on_success,
+        test_short_branch_observable,
+        test_ancestor_counts_short_branch,
+        test_short_branch_missing_data,
+        test_short_branch_rate_mixture,
+        test_short_branch_true_zero,
+        test_short_branch_brute_force,
+        test_align_short_branch,
         test_align_spec_example,
         test_align_two_leaf_enumeration,
         test_align_three_leaf_joint,

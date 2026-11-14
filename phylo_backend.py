@@ -350,16 +350,22 @@ def transition_and_jumps(a, b, t):
     with P0 the stationary projection; the result satisfies the reversible
     identity pi_0 * J[0][1] = pi_1 * J[1][0] and row sums equal to the
     unconditional expected jump counts.
+
+    1 - exp(-s*t) is evaluated as -expm1(-s*t): for very short branches
+    (s*t below machine epsilon) math.exp(-s*t) rounds to exactly 1.0,
+    which would zero out the off-diagonal transition probabilities and
+    make genuinely observable variation look unobservable.
     """
     s = a + b
     if s <= 0.0 or t <= 0.0:
         return ((1.0, 0.0), (0.0, 1.0)), ((0.0, 0.0), (0.0, 0.0))
     u = math.exp(-s * t)
-    P = (((b + a * u) / s, a * (1.0 - u) / s),
-         (b * (1.0 - u) / s, (a + b * u) / s))
+    omu = -math.expm1(-s * t)   # accurate 1 - exp(-s*t), even for s*t tiny
+    P = (((b + a * u) / s, a * omu / s),
+         (b * omu / s, (a + b * u) / s))
     ab = a * b
     s2 = s * s
-    t1 = (1.0 - u) / s   # integral of exp(-s*x) over [0, t]
+    t1 = omu / s         # integral of exp(-s*x) over [0, t]
     t2 = t * u           # integral of exp(-s*t) over [0, t]
     k = 2.0 * ab / s2
     d = a - b
@@ -451,36 +457,105 @@ def solve(edges, root, leaves, pi, a_q, b_q, rates, sites):
             M[v] = mv
         return A, C, M
 
-    def downward(L, ps, js):
-        """Root-to-leaves pass: for each edge e = (u -> v) accumulate
-        S[e] = sum_{i,j} P(X_u=i, data outside v) * J_e[i][j] * L_v[j],
-        i.e. E[#jumps on e * 1(data)] for the leaf-likelihood scenario L."""
+    # Outside-category polynomials.  Categories: 0 = empty set of outside
+    # leaves (only at the root), 1 = all A, 2 = all C, 3 = mixed (not all
+    # identical).  Category merge: empty is the identity, mixed absorbs,
+    # all-A meets all-C -> mixed.  The merge is commutative and
+    # associative, so sibling products decompose into prefix/suffix
+    # products.  All accumulated terms are non-negative: the conditional
+    # jump counts are built directly as sums of products, never as
+    # differences of nearly equal scenario totals (the previous
+    # obs - allA - allC subtraction collapsed catastrophically whenever
+    # P(V) was tiny, e.g. for very short branches, distorting the counts
+    # on ancestor edges).
+    def merge_polys(P, Q):
+        pe, pa, pc, pm = P
+        qe, qa, qc, qm = Q
+        return (pe * qe,
+                pe * qa + pa * (qe + qa),
+                pe * qc + pc * (qe + qc),
+                pm * (qe + qa + qc + qm) + (pe + pa + pc) * qm
+                + pa * qc + pc * qa)
+
+    ident_poly = (1.0, 0.0, 0.0, 0.0)
+
+    def downward(A, C, M, ps, js):
+        """Root-to-leaves pass returning, per edge e = (u -> v),
+        S[e] = E[#jumps on e * 1(E and V)] for the site whose upward
+        partials are (A, C, M).  For each edge the outside-category
+        polynomial H of u (rootward data plus sibling subtrees) is
+        combined with the below-v partials so that outside and below
+        leaves together are not all identical:
+            outside mixed       -> below anything compatible (A + C + M)
+            outside all A       -> below not all A (C + M)
+            outside all C       -> below not all C (A + M)
+            outside empty       -> below mixed (M)
+        S[e] = sum_{i,j} J_e[i][j] * W[i][j] with W the corresponding
+        non-negative combination."""
         S = [0.0] * n_edges
-        g = {root: (pi[0], pi[1])}
+        # G[v][cat] = pair over states: P(X_v = state, observation
+        # outside v compatible, outside leaves in category cat).
+        G = {root: ((pi[0], pi[1]), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0))}
         for u in parents_first:
             ch = children.get(u)
             if not ch:
                 continue
-            bs = []
+            gu = G[u]
+            # Per child and per state at u: the child-subtree polynomial
+            # (0, nA, nC, nM) of partial likelihoods propagated to u.
+            polys = []
             for child, ei in ch:
                 P = ps[ei]
-                lc = L[child]
-                bs.append((P[0][0] * lc[0] + P[0][1] * lc[1],
-                           P[1][0] * lc[0] + P[1][1] * lc[1]))
-            gu = g[u]
-            for k, (child, ei) in enumerate(ch):
-                u0, u1 = gu
-                for l in range(len(ch)):
-                    if l != k:
-                        u0 *= bs[l][0]
-                        u1 *= bs[l][1]
-                J = js[ei]
-                lc = L[child]
-                S[ei] += (u0 * (J[0][0] * lc[0] + J[0][1] * lc[1])
-                          + u1 * (J[1][0] * lc[0] + J[1][1] * lc[1]))
+                ac, cc, mc = A[child], C[child], M[child]
+                per_state = []
+                for st in (0, 1):
+                    p0, p1 = P[st]
+                    per_state.append((0.0,
+                                      p0 * ac[0] + p1 * ac[1],
+                                      p0 * cc[0] + p1 * cc[1],
+                                      p0 * mc[0] + p1 * mc[1]))
+                polys.append(per_state)
+            k = len(ch)
+            # H[m][st] = outside-category polynomial of child m given
+            # state st at u (rootward part merged with all siblings).
+            H = []
+            for m in range(k):
+                H.append([None, None])
+            for st in (0, 1):
+                gst = (gu[0][st], gu[1][st], gu[2][st], gu[3][st])
+                pref = [ident_poly]
+                for m in range(k):
+                    pref.append(merge_polys(pref[m], polys[m][st]))
+                suff = [ident_poly] * (k + 1)
+                for m in range(k - 1, -1, -1):
+                    suff[m] = merge_polys(polys[m][st], suff[m + 1])
+                for m in range(k):
+                    H[m][st] = merge_polys(gst,
+                                           merge_polys(pref[m],
+                                                       suff[m + 1]))
+            for m in range(k):
+                child, ei = ch[m]
+                h0, h1 = H[m]
                 P = ps[ei]
-                g[child] = (u0 * P[0][0] + u1 * P[1][0],
-                            u0 * P[0][1] + u1 * P[1][1])
+                # Propagate the outside categories across the edge.
+                G[child] = tuple(
+                    (h0[cat] * P[0][0] + h1[cat] * P[1][0],
+                     h0[cat] * P[0][1] + h1[cat] * P[1][1])
+                    for cat in range(4))
+                av, cv, mv = A[child], C[child], M[child]
+                lobs = (av[0] + cv[0] + mv[0], av[1] + cv[1] + mv[1])
+                J = js[ei]
+                acc = 0.0
+                for st in (0, 1):
+                    he, ha, hc, hm = H[m][st]
+                    jst = J[st]
+                    for j in (0, 1):
+                        wij = (hm * lobs[j]
+                               + ha * (cv[j] + mv[j])
+                               + hc * (av[j] + mv[j])
+                               + he * mv[j])
+                        acc += jst[j] * wij
+                S[ei] += acc
         return S
 
     # Valid empty sites takes precedence.
@@ -502,15 +577,9 @@ def solve(edges, root, leaves, pi, a_q, b_q, rates, sites):
         for w, ps, js in rate_data:
             A, C, M = upward(site, ps)
             p_ev += w * (pi[0] * M[root][0] + pi[1] * M[root][1])
-            L_obs = {}
-            for v in A:
-                av, cv, mv = A[v], C[v], M[v]
-                L_obs[v] = (av[0] + cv[0] + mv[0], av[1] + cv[1] + mv[1])
-            s_obs = downward(L_obs, ps, js)
-            s_all_a = downward(A, ps, js)
-            s_all_c = downward(C, ps, js)
+            s_ev = downward(A, C, M, ps, js)
             for ei in range(n_edges):
-                num[ei] += w * (s_obs[ei] - s_all_a[ei] - s_all_c[ei])
+                num[ei] += w * s_ev[ei]
         if not p_ev > 0.0:
             output.append({"status": "impossible"})
         else:
