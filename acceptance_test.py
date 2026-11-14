@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BACKEND = os.path.join(HERE, "phylo_backend.py")
@@ -885,6 +886,397 @@ def test_align_output_replaced():
               ok1 and ok2 and ok3, "%r -> %r -> %r" % (out1, out2, out3))
 
 
+# ---------------------------------------------------------------------------
+# Distance-matrix entry tests
+# ---------------------------------------------------------------------------
+#
+# Expectations are derived independently: an explicit unrooted tree with
+# rational edges generates the matrix, and an independent path-sum routine
+# checks the reconstructed edges.  The per-site inference is cross-checked
+# against the ordinary edges entry (and brute force).
+
+def _edges_to_adj(edges):
+    adj = {}
+    for p, c, t in edges:
+        adj.setdefault(p, {})[c] = Fraction(t)
+        adj.setdefault(c, {})[p] = Fraction(t)
+    return adj
+
+
+def _independent_leaf_dist(edges, leaves):
+    adj = _edges_to_adj(edges)
+    out = {}
+    for s in leaves:
+        seen = {s: Fraction(0)}
+        stack = [s]
+        while stack:
+            u = stack.pop()
+            for v, t in adj[u].items():
+                if v not in seen:
+                    seen[v] = seen[u] + t
+                    stack.append(v)
+        for b in leaves:
+            if b != s:
+                out[(s, b)] = seen[b]
+    return out
+
+
+def _matrix_from_dist(labels, dist):
+    rows = []
+    for a in labels:
+        row = []
+        for b in labels:
+            if a == b:
+                row.append("0/1")
+            else:
+                f = dist[(a, b)]
+                row.append("%d/%d" % (f.numerator, f.denominator))
+        rows.append(row)
+    return rows
+
+
+def distances_payload(distances, sites=None, **kw):
+    p = example_payload(sites if sites is not None else [],
+                        **{k: v for k, v in kw.items() if k != "sites"})
+    del p["edges"]
+    p["distances"] = distances
+    return p
+
+
+def test_distances_spec_example():
+    # labels a,b,c equidistant 2/1, outgroup a: three unit edges, a's edge
+    # split in half by the root.
+    labels = ["a", "b", "c"]
+    matrix = [["0/1", "2/1", "2/1"],
+              ["2/1", "0/1", "2/1"],
+              ["2/1", "2/1", "0/1"]]
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(distances_payload(
+            {"labels": labels, "matrix": matrix, "outgroup": "a"},
+            sites=[{"a": "A", "b": "C", "c": "?"}]), d)
+        ok = proc.returncode == 0
+        detail = proc.stdout
+        res = json.loads(out) if ok else {}
+        if ok:
+            edges = res["edges"]
+            ok = set(res) == {"edges", "result"}
+            # Three unit edges on the unrooted tree, root midway on a's edge.
+            leaf_edges = [t for (p, c, t) in edges if c in labels or p in labels]
+            ok = ok and all(Fraction(t) == 1 for (_p, c, t) in edges
+                            if c in ("b", "c"))
+            # a's pendant edge is split into two halves by the root.
+            a_edge = [Fraction(t) for (p, c, t) in edges if c == "a"]
+            ok = ok and len(a_edge) == 1 and a_edge[0] == Fraction(1, 2)
+            # Exact pairwise path lengths.
+            got = _independent_leaf_dist(
+                [(p, c, Fraction(t)) for (p, c, t) in edges], labels)
+            want = {(x, y): Fraction(2) for x in labels for y in labels
+                    if x != y}
+            ok = ok and got == want
+            # Result equals the ordinary edges entry fed the same tree.
+            proc2, out2 = run_backend(
+                {"edges": edges, "pi": ["1/2", "1/2"],
+                 "Q": [["-1/1", "1/1"], ["1/1", "-1/1"]],
+                 "rates": [["1/1", "1/1"]],
+                 "sites": [{"a": "A", "b": "C", "c": "?"}]}, d)
+            ok = ok and proc2.returncode == 0 \
+                and res["result"] == json.loads(out2)
+            detail = out
+        check("distances_spec: unit star, a split in half, result matches",
+              ok, detail)
+
+
+def _distances_reconstruction_case(name, labels, tree_edges, outgroup):
+    """Generate a matrix from an explicit rational tree, assert that the
+    backend reconstructs some tree realising it exactly, with positive edges,
+    internal degree >= 3 and the outgroup edge split by the root."""
+    dist = _independent_leaf_dist(tree_edges, labels)
+    matrix = _matrix_from_dist(labels, dist)
+    payload = distances_payload(
+        {"labels": labels, "matrix": matrix, "outgroup": outgroup},
+        sites=[{l: "?" for l in labels}])
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(payload, d)
+        if proc.returncode != 0:
+            check("distances_recon(%s)" % name, False, proc.stdout)
+            return
+        res = json.loads(out)
+        edges = res["edges"]
+        ok = set(res) == {"edges", "result"}
+        deg = {}
+        nodes = set()
+        for p, c, t in edges:
+            ok = ok and Fraction(t) > 0
+            deg[p] = deg.get(p, 0) + 1
+            deg[c] = deg.get(c, 0) + 1
+            nodes.add(p)
+            nodes.add(c)
+        parents = {p for p, c, t in edges}
+        children = {c for p, c, t in edges}
+        roots = parents - children
+        ok = ok and len(roots) == 1
+        root = next(iter(roots))
+        ok = ok and deg[root] == 2
+        ok = ok and {v for v in nodes if v in labels} == set(labels)
+        ok = ok and all(deg[l] == 1 for l in labels)
+        ok = ok and all(deg[v] >= 3 for v in nodes
+                        if v not in labels and v != root)
+        rc = [c for p, c, t in edges if p == root]
+        ok = ok and len(rc) == 2 and outgroup in rc
+        got = _independent_leaf_dist(
+            [(p, c, Fraction(t)) for (p, c, t) in edges], labels)
+        ok = ok and got == dist
+        check("distances_recon(%s)" % name, ok, out if not ok else "")
+
+
+def test_distances_reconstruction_variants():
+    # Multifurcating star (6 leaves, all mutual distances 2).
+    labels = list("abcdef")
+    star = [("u", l, Fraction(1)) for l in labels]
+    _distances_reconstruction_case("star6", labels, star, "a")
+    # Caterpillar with internal structure and an outgroup that is not last.
+    cat = [("u", "a", Fraction(1)), ("u", "v", Fraction(2)),
+           ("v", "b", Fraction(3)), ("v", "w", Fraction(1)),
+           ("w", "c", Fraction(4)), ("w", "d", Fraction(5))]
+    _distances_reconstruction_case("caterpillar4", list("abcd"), cat, "d")
+    # Binary tree with fractional edge lengths.
+    frac = [("u", "a", Fraction(1, 2)), ("u", "b", Fraction(3, 4)),
+            ("u", "w", Fraction(1, 3)), ("w", "c", Fraction(2, 7)),
+            ("w", "d", Fraction(5, 6))]
+    _distances_reconstruction_case("fractional", list("abcd"), frac, "b")
+    # A multifurcation produced by a contracted zero-length internal edge.
+    contracted = {
+        ("a", "b"): Fraction(4), ("c", "d"): Fraction(6),
+        ("a", "c"): Fraction(5), ("a", "d"): Fraction(5),
+        ("b", "c"): Fraction(5), ("b", "d"): Fraction(5),
+    }
+    contracted.update({(b, a): v for (a, b), v in contracted.items()})
+    labels4 = list("abcd")
+    matrix = _matrix_from_dist(labels4, contracted)
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(distances_payload(
+            {"labels": labels4, "matrix": matrix, "outgroup": "a"},
+            sites=[{l: "?" for l in labels4}]), d)
+        ok = proc.returncode == 0
+        detail = proc.stdout
+        if ok:
+            res = json.loads(out)
+            got = _independent_leaf_dist(
+                [(p, c, Fraction(t)) for (p, c, t) in res["edges"]],
+                labels4)
+            ok = got == contracted
+            # The star that realises this has an internal node of degree 4.
+            deg = {}
+            for p, c, t in res["edges"]:
+                deg[p] = deg.get(p, 0) + 1
+                deg[c] = deg.get(c, 0) + 1
+            ok = ok and max(deg.values()) >= 4
+        check("distances_recon(contracted zero edge -> multifurcation)",
+              ok, detail)
+
+
+def test_distances_rejections():
+    good_matrix = [["0/1", "2/1", "2/1"],
+                   ["2/1", "0/1", "2/1"],
+                   ["2/1", "2/1", "0/1"]]
+    good = {"labels": ["a", "b", "c"], "matrix": good_matrix,
+            "outgroup": "a"}
+
+    def mutated(**kw):
+        m = dict(good)
+        m.update(kw)
+        return distances_payload(m)
+
+    def with_dist(d):
+        return distances_payload(d)
+
+    cases = [
+        ("distances with sequences",
+         {**{k: v for k, v in distances_payload(good).items()
+             if k != "sites"}, "sequences": {"a": "A", "b": "CA"}},
+         "$.distances"),        ("edges and distances together",
+         {**example_payload([]),
+          "distances": good}, "$.distances"),
+        ("distances extra member",
+         with_dist({**good, "extra": 1}), "$.distances.extra"),
+        ("distances missing matrix",
+         distances_payload({"labels": ["a", "b", "c"], "outgroup": "a"}),
+         "$.distances"),
+        ("labels not array", with_dist({**good, "labels": "abc"}),
+         "$.distances.labels"),
+        ("fewer than three labels",
+         with_dist({**good, "labels": ["a", "b"],
+                    "matrix": [["0/1", "1/1"], ["1/1", "0/1"]]}),
+         "$.distances.labels"),
+        ("duplicate label",
+         with_dist({**good, "labels": ["a", "a", "c"]}),
+         "$.distances.labels[1]"),
+        ("bad label identifier",
+         with_dist({**good, "labels": ["a", "b", "c_1"]}),
+         "$.distances.labels[2]"),
+        ("matrix wrong row count",
+         with_dist({**good, "matrix": [["0/1", "2/1"], ["2/1", "0/1"]]}),
+         "$.distances.matrix"),
+        ("matrix ragged row",
+         with_dist({**good, "matrix": [["0/1", "2/1", "2/1"],
+                                        ["2/1", "0/1"],
+                                        ["2/1", "2/1", "0/1"]]}),
+         "$.distances.matrix[1]"),
+        ("matrix nonzero diagonal",
+         with_dist({**good, "matrix": [["1/1", "2/1", "2/1"],
+                                        ["2/1", "0/1", "2/1"],
+                                        ["2/1", "2/1", "0/1"]]}),
+         "$.distances.matrix[0][0]"),
+        ("matrix zero off-diagonal",
+         with_dist({**good, "matrix": [["0/1", "0/1", "2/1"],
+                                        ["0/1", "0/1", "2/1"],
+                                        ["2/1", "2/1", "0/1"]]}),
+         "$.distances.matrix[0][1]"),
+        ("matrix asymmetric",
+         with_dist({**good, "matrix": [["0/1", "3/1", "2/1"],
+                                        ["2/1", "0/1", "2/1"],
+                                        ["2/1", "2/1", "0/1"]]}),
+         "$.distances.matrix[0][1]"),
+        ("outgroup unknown",
+         with_dist({**good, "outgroup": "z"}), "$.distances.outgroup"),
+        ("non-additive four-point",
+         distances_payload({"labels": ["a", "b", "c", "d"],
+                            "matrix": [["0/1", "2/1", "3/1", "2/1"],
+                                       ["2/1", "0/1", "2/1", "3/1"],
+                                       ["3/1", "2/1", "0/1", "2/1"],
+                                       ["2/1", "3/1", "2/1", "0/1"]],
+                            "outgroup": "a"}), "$.distances"),
+        ("non-additive triangle",
+         distances_payload({"labels": ["a", "b", "c"],
+                            "matrix": [["0/1", "1/1", "1/1"],
+                                       ["1/1", "0/1", "3/1"],
+                                       ["1/1", "3/1", "0/1"]],
+                            "outgroup": "a"}), "$.distances"),
+        ("zero-length leaf edge required",
+         distances_payload({"labels": ["a", "b", "c"],
+                            "matrix": [["0/1", "1/1", "1/1"],
+                                       ["1/1", "0/1", "2/1"],
+                                       ["1/1", "2/1", "0/1"]],
+                            "outgroup": "a"}), "$.distances"),
+        ("distances site unknown leaf",
+         distances_payload(good,
+                           sites=[{"a": "A", "b": "C", "z": "?"}]),
+         "$.sites[0]"),
+    ]
+    for name, payload, want_path in cases:
+        with tempfile.TemporaryDirectory() as d:
+            proc, out = run_backend(payload, d, sentinel="SENTINEL")
+            ok = proc.returncode == 1 and out == "SENTINEL"
+            detail = ""
+            if ok:
+                try:
+                    err = json.loads(proc.stdout)
+                    ok = (err.get("status") == "error"
+                          and err.get("path") == want_path
+                          and isinstance(err.get("message"), str))
+                    detail = proc.stdout.strip()
+                except (json.JSONDecodeError, AttributeError):
+                    ok = False
+                    detail = "stdout is not an error JSON: %r" % proc.stdout
+            check("distances_reject: %s" % name, ok, detail)
+
+
+def test_distances_result_and_multifurcation_brute():
+    # A multifurcating 4-leaf tree fed as a matrix; every site's result must
+    # match brute-force enumeration over all node-state assignments.
+    labels = list("abcd")
+    tree = [("u", "a", Fraction(1)), ("u", "b", Fraction(2)),
+            ("u", "w", Fraction(3)), ("w", "c", Fraction(4)),
+            ("w", "d", Fraction(5))]
+    dist = _independent_leaf_dist(tree, labels)
+    matrix = _matrix_from_dist(labels, dist)
+    sites = [{"a": "A", "b": "C", "c": "?", "d": "A"},
+             {"a": "?", "b": "?", "c": "?", "d": "?"}]
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(distances_payload(
+            {"labels": labels, "matrix": matrix, "outgroup": "c"},
+            sites=sites, pi=["1/3", "2/3"],
+            q=[["-2/1", "2/1"], ["1/1", "-1/1"]],
+            rates=[["1/2", "1/3"], ["3/2", "2/3"]]), d)
+        if proc.returncode != 0:
+            check("distances_brute: exit 0", False, proc.stdout)
+            return
+        res = json.loads(out)
+        edges = [(p, c, Fraction(t)) for (p, c, t) in res["edges"]]
+        # Feed the reconstructed tree to the sites entry, then brute force.
+        sites_payload = {"edges": res["edges"], "pi": ["1/3", "2/3"],
+                         "Q": [["-2/1", "2/1"], ["1/1", "-1/1"]],
+                         "rates": [["1/2", "1/3"], ["3/2", "2/3"]],
+                         "sites": sites}
+        proc2, out2 = run_backend(sites_payload, d)
+        ok = proc2.returncode == 0 and res["result"] == json.loads(out2)
+        detail = out
+        # Independent Euler-tour node ordering for the brute-force reference.
+        nodes = []
+        for p, c, t in edges:
+            if p not in nodes:
+                nodes.append(p)
+            if c not in nodes:
+                nodes.append(c)
+        adj = _edges_to_adj(edges)
+        roots = [n for n in adj if n not in {c for p, c, t in edges}]
+        root = roots[0]
+        edges_f = [(p, c, float(t)) for p, c, t in edges]
+        leaves = labels
+        pi_f = [1.0 / 3.0, 2.0 / 3.0]
+        a_q, b_q = 2.0, 1.0
+        rates_f = [(0.5, 1.0 / 3.0), (1.5, 2.0 / 3.0)]
+        ok_all = ok
+        for k, site in enumerate(sites):
+            p_ev, p_v, num = brute_force_raw(nodes, root, edges_f, leaves,
+                                             pi_f, a_q, b_q, rates_f, site)
+            got = res["result"][k]
+            if p_ev == 0.0:
+                if got != {"status": "impossible"}:
+                    ok_all = False
+                continue
+            if abs(got["likelihood"] - p_ev / p_v) > 1e-8:
+                ok_all = False
+                detail = "site %d likelihood %r vs %r" % (
+                    k, got["likelihood"], p_ev / p_v)
+            for e in range(len(edges)):
+                if abs(got["counts"][e] - num[e] / p_ev) > 1e-6:
+                    ok_all = False
+                    detail = "site %d edge %d count %r vs %r" % (
+                        k, e, got["counts"][e], num[e] / p_ev)
+        check("distances_brute: multifurcating result matches enumeration",
+              ok_all, detail)
+
+
+def test_distances_output_replaced():
+    good = {"labels": ["a", "b", "c"],
+            "matrix": [["0/1", "2/1", "2/1"],
+                       ["2/1", "0/1", "2/1"],
+                       ["2/1", "2/1", "0/1"]],
+            "outgroup": "a"}
+    with tempfile.TemporaryDirectory() as d:
+        proc1, out1 = run_backend(distances_payload(good), d,
+                                  sentinel="SENTINEL")
+        ok1 = proc1.returncode == 0 and out1 != "SENTINEL"
+        # A non-additive matrix keeps the previous output.
+        proc2, out2 = run_backend(distances_payload(
+            {"labels": ["a", "b", "c"],
+             "matrix": [["0/1", "1/1", "1/1"],
+                        ["1/1", "0/1", "3/1"],
+                        ["1/1", "3/1", "0/1"]],
+             "outgroup": "a"}), d)
+        ok2 = proc2.returncode == 1 and out2 == out1
+        proc3, out3 = run_backend(distances_payload(
+            {"labels": ["a", "b", "c"],
+             "matrix": [["0/1", "3/1", "3/1"],
+                        ["3/1", "0/1", "3/1"],
+                        ["3/1", "3/1", "0/1"]],
+             "outgroup": "b"}), d)
+        ok3 = proc3.returncode == 0 and out3 != out1
+        check("distances_output: replaced on success, kept on rejection",
+              ok1 and ok2 and ok3, "%r -> %r -> %r" % (out1, out2, out3))
+
+
 def main():
     tests = [
         test_jump_matrix_vs_quadrature,
@@ -908,6 +1300,11 @@ def main():
         test_align_empty_and_unobservable,
         test_align_rejections,
         test_align_output_replaced,
+        test_distances_spec_example,
+        test_distances_reconstruction_variants,
+        test_distances_rejections,
+        test_distances_result_and_multifurcation_brute,
+        test_distances_output_replaced,
     ]
     for t in tests:
         t()

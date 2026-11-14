@@ -31,6 +31,33 @@ INPUT.json is an object with exactly the members "edges", "pi", "Q", "rates",
   rates : [[r, w], ...]               non-empty, r >= 0, w > 0, sum w = 1
   sites : [{leaf: "A"|"C"|"?", ...}, ...]   each map covers exactly all leaves
 
+Distance-matrix entry
+---------------------
+"distances" may replace "edges" (the two may not coexist); it is only
+combined with "sites" (not with "sequences").  It is an object with exactly
+the members "labels", "matrix", "outgroup":
+
+  labels   : >= 3 distinct ASCII alphanumeric leaf identifiers (original rule)
+  matrix   : square len(labels) x len(labels) array of "p/q" numbers; exactly
+             symmetric, zero diagonal, strictly positive off-diagonal
+  outgroup : one of the labels
+
+An unrooted tree with leaf set exactly the labels is reconstructed from the
+matrix: every internal node has degree >= 3, every edge has strictly
+positive rational length, and the path length between every two leaves
+equals the matrix entry exactly.  If no such tree exists (the matrix is not
+a strictly additive tree metric, e.g. it violates the four-point condition
+or would need a zero-length edge) the whole run is rejected with path
+"$.distances".
+
+A root is then inserted at the midpoint of the edge incident to the outgroup
+leaf and all edges are oriented away from it; "pi" applies to this new root
+and the site inference is unchanged.  The output has exactly the members
+"edges" and "result": "edges" is the usual [parent, child, t] triples with
+reduced "p/q" lengths (new internal nodes use fresh identifiers that do not
+collide with leaves; naming and edge order are arbitrary), and "result" is
+the ordinary per-site result in that edge order.
+
 Output (written to OUTPUT.json, replacing it, only on success):
   []                              if sites is empty (takes precedence)
   {"status": "unobservable"}      if P(V) = 0
@@ -279,6 +306,290 @@ def check_sites(value, leaf_set):
 SEQUENCE_RE = re.compile(r"[AC]*")
 
 
+def check_distances(value):
+    """Validate a "distances" member and return (labels, Fraction matrix,
+    outgroup)."""
+    path = "$.distances"
+    obj = _as_object(value, path)
+    required = ("labels", "matrix", "outgroup")
+    for key in obj:
+        if key not in required:
+            reject("%s.%s" % (path, key),
+                   "unknown member %r in distances" % (key,))
+    for key in required:
+        if key not in obj:
+            reject(path, "missing member %r in distances" % (key,))
+    labels = obj["labels"]
+    lpath = "%s.labels" % path
+    if not _is_array(labels):
+        reject(lpath, "labels must be an array of leaf identifiers")
+    if len(labels) < 3:
+        reject(lpath, "at least three labels are required")
+    seen = set()
+    for i, name in enumerate(labels):
+        if not isinstance(name, str) or IDENT_RE.fullmatch(name) is None:
+            reject("%s[%d]" % (lpath, i),
+                   "leaf identifier must be a non-empty ASCII alphanumeric "
+                   "string", i)
+        if name in seen:
+            reject("%s[%d]" % (lpath, i),
+                   "duplicate leaf identifier %r" % (name,), i)
+        seen.add(name)
+    n = len(labels)
+    mpath = "%s.matrix" % path
+    raw = obj["matrix"]
+    if not _is_array(raw):
+        reject(mpath, "matrix must be a square array")
+    if len(raw) != n:
+        reject(mpath, "matrix must have %d rows (one per label)" % n)
+    matrix = []
+    for i, row in enumerate(raw):
+        rpath = "%s[%d]" % (mpath, i)
+        if not _is_array(row):
+            reject(rpath, "each matrix row must be an array", i)
+        if len(row) != n:
+            reject(rpath, "matrix row must have %d entries (one per label)"
+                   % n, i)
+        vals = []
+        for j, cell in enumerate(row):
+            f = _as_fraction(cell, "%s[%d]" % (rpath, j), i)
+            if i == j:
+                if f != 0:
+                    reject("%s[%d]" % (rpath, j),
+                           "diagonal entries must be zero", i)
+            elif f <= 0:
+                reject("%s[%d]" % (rpath, j),
+                       "off-diagonal distances must be > 0", i)
+            vals.append(f)
+        matrix.append(vals)
+    for i in range(n):
+        for j in range(n):
+            if matrix[i][j] != matrix[j][i]:
+                reject("%s[%d][%d]" % (mpath, i, j),
+                       "matrix must be exactly symmetric", i)
+    opath = "%s.outgroup" % path
+    outgroup = obj["outgroup"]
+    if not isinstance(outgroup, str):
+        reject(opath, "outgroup must be a leaf identifier")
+    if outgroup not in seen:
+        reject(opath, "outgroup %r is not one of the labels" % (outgroup,))
+    return list(labels), matrix, outgroup
+
+
+# ---------------------------------------------------------------------------
+# Distance-matrix reconstruction
+# ---------------------------------------------------------------------------
+#
+# The matrix is an exact additive tree metric: neighbour-joining style leaf
+# insertion (additive phylogeny) recovers the unique unrooted tree whose
+# leaf-to-leaf path lengths equal the entries.  All arithmetic is on
+# Fractions, so the reconstructed edge lengths are exact and can be emitted
+# as reduced "p/q" strings.  A metric that is not additive, or whose
+# realisation would need a non-positive edge, cannot be realised: the run is
+# rejected with path "$.distances".
+
+def _adj_add(adj, u, v, length):
+    adj.setdefault(u, {})[v] = length
+    adj.setdefault(v, {})[u] = length
+
+
+def _adj_remove(adj, u, v):
+    del adj[u][v]
+    del adj[v][u]
+    if not adj[u]:
+        del adj[u]
+    if not adj[v]:
+        del adj[v]
+
+
+def _tree_path(adj, src, dst):
+    """Node sequence of the unique simple path src -> dst (tree)."""
+    parent = {src: None}
+    stack = [src]
+    while stack:
+        u = stack.pop()
+        if u == dst:
+            break
+        for v in adj.get(u, ()):
+            if v not in parent:
+                parent[v] = u
+                stack.append(v)
+    nodes = []
+    cur = dst
+    while cur is not None:
+        nodes.append(cur)
+        cur = parent[cur]
+    return nodes[::-1]
+
+
+def _all_leaf_distances(adj, leaves):
+    """Exact distances from each leaf to every other node, keyed by (leaf, n)."""
+    dist = {}
+    for leaf in leaves:
+        stack = [(leaf, None, Fraction(0))]
+        while stack:
+            u, prev, d = stack.pop()
+            dist[(leaf, u)] = d
+            for v, length in adj.get(u, {}).items():
+                if v != prev:
+                    stack.append((v, u, d + length))
+    return dist
+
+
+def reconstruct_tree(labels, matrix, outgroup):
+    """Reconstruct the unrooted additive tree, then root it at the midpoint
+    of the edge incident to `outgroup`.
+
+    Returns (edge_triples, root, leaves) where edge_triples is a list of
+    (parent, child, Fraction t) oriented away from the new root.
+    """
+    n = len(labels)
+    index = {name: i for i, name in enumerate(labels)}
+    adj = {}
+    used = set(labels)
+    counter = [0]
+
+    def new_node():
+        while True:
+            name = "N%d" % counter[0]
+            counter[0] += 1
+            if name not in used:
+                used.add(name)
+                return name
+
+    def d(x, y):
+        return matrix[index[x]][index[y]]
+
+    # --- Base case: the three-leaf star ------------------------------------
+    a, b, c = labels[0], labels[1], labels[2]
+    la = (d(a, b) + d(a, c) - d(b, c)) / 2
+    lb = (d(a, b) + d(b, c) - d(a, c)) / 2
+    lc = (d(a, c) + d(b, c) - d(a, b)) / 2
+    if la <= 0 or lb <= 0 or lc <= 0:
+        reject("$.distances",
+               "the distance matrix cannot be realised with strictly "
+               "positive edge lengths (a zero or negative pendant edge "
+               "would be required)")
+    centre = new_node()
+    _adj_add(adj, centre, a, la)
+    _adj_add(adj, centre, b, lb)
+    _adj_add(adj, centre, c, lc)
+    placed = [a, b, c]
+
+    # --- Add the remaining leaves one at a time ----------------------------
+    for k in range(3, n):
+        leaf = labels[k]
+        # Limb length: half the Gromov product minimised over existing
+        # leaves; the minimising pair has the attachment point on its path.
+        best = None
+        pair = None
+        for ii in range(len(placed)):
+            for jj in range(ii + 1, len(placed)):
+                i, j = placed[ii], placed[jj]
+                val = (d(leaf, i) + d(leaf, j) - d(i, j)) / 2
+                if best is None or val < best:
+                    best = val
+                    pair = (i, j)
+        limb = best
+        if limb <= 0:
+            reject("$.distances",
+                   "the distance matrix cannot be realised with strictly "
+                   "positive edge lengths (a zero or negative pendant edge "
+                   "would be required)")
+        i, j = pair
+        dij = d(i, j)
+        pos = d(leaf, i) - limb      # distance from i to the attachment
+        if pos <= 0 or pos >= dij:
+            reject("$.distances",
+                   "the distance matrix is not an additive tree metric "
+                   "(leaf %r cannot be attached to a new internal point)"
+                   % (leaf,))
+        path = _tree_path(adj, i, j)
+        attach = None
+        remaining = pos
+        for t in range(len(path) - 1):
+            u, v = path[t], path[t + 1]
+            length = adj[u][v]
+            if remaining > length:
+                remaining -= length
+                continue
+            if remaining == length:
+                attach = v
+                break
+            if remaining == 0:
+                attach = u
+                break
+            # Strictly interior: split edge (u, v) at a fresh node.
+            w = new_node()
+            _adj_remove(adj, u, v)
+            _adj_add(adj, u, w, remaining)
+            _adj_add(adj, w, v, length - remaining)
+            attach = w
+            break
+        if attach is None:
+            reject("$.distances",
+                   "the distance matrix is not an additive tree metric "
+                   "(attachment point off the reference path)")
+        _adj_add(adj, attach, leaf, limb)
+        placed.append(leaf)
+
+    # --- Exact verification -------------------------------------------------
+    for v in adj:
+        deg = len(adj[v])
+        if v in index:
+            if deg != 1:
+                reject("$.distances",
+                       "reconstructed tree does not have leaf %r at degree 1"
+                       % (v,))
+        elif deg < 3:
+            reject("$.distances",
+                   "reconstructed tree has an internal node of degree %d "
+                   "(must be at least 3)" % (deg,))
+    dist = _all_leaf_distances(adj, labels)
+    for x in range(n):
+        for y in range(x + 1, n):
+            if dist.get((labels[x], labels[y])) != matrix[x][y]:
+                reject("$.distances",
+                       "the distance matrix is not an additive tree metric "
+                       "(path %r..%r does not match its entry)"
+                       % (labels[x], labels[y]))
+
+    # --- Root at the outgroup edge's midpoint ------------------------------
+    if outgroup not in adj or len(adj[outgroup]) != 1:
+        reject("$.distances", "outgroup leaf is not a leaf of the tree")
+    neighbour, length = next(iter(adj[outgroup].items()))
+    root = new_node()
+    _adj_remove(adj, outgroup, neighbour)
+    _adj_add(adj, root, outgroup, length / 2)
+    _adj_add(adj, root, neighbour, length / 2)
+
+    # Orient every edge away from the root.
+    edge_triples = []
+    stack = [(root, None)]
+    while stack:
+        u, prev = stack.pop()
+        for v, length in adj.get(u, {}).items():
+            if v != prev:
+                edge_triples.append((u, v, length))
+                stack.append((v, u))
+    return edge_triples, root, list(labels)
+
+
+def run_distances_entry(model):
+    """Distance-matrix entry: infer the sites on the reconstructed tree and
+    emit exactly the two members "edges" and "result"."""
+    result = solve(model["edges"], model["root"], model["leaves"],
+                   model["pi"], model["a_q"], model["b_q"], model["rates"],
+                   model["sites"])
+    return {"edges": model["edge_strings"], "result": result}
+
+
+def _fraction_string(value):
+    return "%d/%d" % (value.numerator, value.denominator)
+
+
+
+
 def check_sequences(value, leaf_set):
     path = "$.sequences"
     seqs = _as_object(value, path)
@@ -309,11 +620,14 @@ def parse_input(text):
     except (json.JSONDecodeError, ValueError) as exc:
         reject("$", "invalid JSON syntax (%s)" % exc)
     top = _as_object(data, "$")
-    # "sequences" replaces "sites" for the alignment import entry; the two
-    # may not coexist (with both present, "sequences" is an unknown member
-    # of the original entry).
+    # "sequences" replaces "sites" for the alignment import entry; "distances"
+    # replaces "edges" for the distance-matrix entry.  Neither may coexist
+    # with the member it replaces, and "distances" may only be combined with
+    # "sites".
     sequences_mode = "sequences" in top and "sites" not in top
-    required = ("edges", "pi", "Q", "rates",
+    distances_mode = "distances" in top and "edges" not in top
+    tree_key = "distances" if distances_mode else "edges"
+    required = (tree_key, "pi", "Q", "rates",
                 "sequences" if sequences_mode else "sites")
     for key in top:
         if key not in required:
@@ -321,6 +635,25 @@ def parse_input(text):
     for key in required:
         if key not in top:
             reject("$", "missing top-level member %r" % (key,))
+    if distances_mode:
+        if sequences_mode:
+            reject("$.distances",
+                   "distances may only be combined with sites, not with "
+                   "sequences")
+        labels, matrix, outgroup = check_distances(top["distances"])
+        edge_triples, root, leaves = reconstruct_tree(labels, matrix,
+                                                      outgroup)
+        edges = [(p, c, float(t)) for (p, c, t) in edge_triples]
+        edge_strings = [[p, c, _fraction_string(t)]
+                        for (p, c, t) in edge_triples]
+        pi = check_pi(top["pi"])
+        a_q, b_q = check_Q(top["Q"])
+        rates = check_rates(top["rates"])
+        model = {"edges": edges, "root": root, "leaves": leaves, "pi": pi,
+                 "a_q": a_q, "b_q": b_q, "rates": rates,
+                 "edge_strings": edge_strings,
+                 "sites": check_sites(top["sites"], set(labels))}
+        return "distances", model
     edges, root, leaves = check_edges(top["edges"])
     if sequences_mode and len(leaves) > 4:
         reject("$.edges", "the sequences entry accepts only trees with "
@@ -734,6 +1067,8 @@ def main(argv):
         mode, model = parse_input(text)
         if mode == "sequences":
             result = run_sequences_entry(model)
+        elif mode == "distances":
+            result = run_distances_entry(model)
         else:
             result = solve(**model)
     except Reject as rj:
