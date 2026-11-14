@@ -6,7 +6,12 @@ Small trees only, with expectations derived independently of the backend:
   * explicit enumeration over all node-state assignments on a 3-leaf tree,
     with per-edge expected jump counts from Simpson-rule numerical
     integration of the endpoint-conditioned jump intensity,
-  * rejection / output-file-preservation checks.
+  * rejection / output-file-preservation checks,
+  * for the alignment import (sequences) entry: independent enumeration of
+    all short-string alignments (joint 3/4-leaf optima, ties, empty
+    strings, a double-gap-column case that discriminates the
+    run-not-breaking cost rule), with per-column inference results checked
+    against both the sites entry and brute-force enumeration.
 
 Run:  python3 acceptance_test.py
 """
@@ -104,8 +109,9 @@ def ref_expected_jumps(a, b, t, i, j, n=4096):
     return acc * h / 3.0 / pij
 
 
-def brute_force(nodes, root, edges, leaves, pi, a_q, b_q, rates, site):
-    """(likelihood, counts) by enumerating all 2^len(nodes) assignments."""
+def brute_force_raw(nodes, root, edges, leaves, pi, a_q, b_q, rates, site):
+    """(P(E and V), P(V), numerator counts) by enumerating all
+    2^len(nodes) assignments; counts are not yet divided by P(E and V)."""
     idx = {v: k for k, v in enumerate(nodes)}
     p_ev = 0.0
     p_v = 0.0
@@ -135,7 +141,155 @@ def brute_force(nodes, root, edges, leaves, pi, a_q, b_q, rates, site):
                 p_ev += w * prob
                 for ei, (p, c, _t) in enumerate(edges):
                     num[ei] += w * prob * EN[ei][st[idx[p]]][st[idx[c]]]
+    return p_ev, p_v, num
+
+
+def brute_force(nodes, root, edges, leaves, pi, a_q, b_q, rates, site):
+    """(likelihood, counts) by enumerating all 2^len(nodes) assignments."""
+    p_ev, p_v, num = brute_force_raw(nodes, root, edges, leaves, pi,
+                                     a_q, b_q, rates, site)
     return p_ev / p_v, [x / p_ev for x in num]
+
+
+# ---------------------------------------------------------------------------
+# Independent alignment reference (enumeration; no code shared with the
+# backend's alignment core)
+# ---------------------------------------------------------------------------
+
+def ref_alignments(seqs):
+    """Generate every valid alignment of seqs: equal-length rows over
+    "AC-", no all-gap column, gap removal restoring each original string."""
+    n = len(seqs)
+    rows = [[] for _ in range(n)]
+    pos = [0] * n
+
+    def rec():
+        if all(pos[i] == len(seqs[i]) for i in range(n)):
+            yield tuple("".join(r) for r in rows)
+            return
+        avail_mask = 0
+        for i in range(n):
+            if pos[i] < len(seqs[i]):
+                avail_mask |= 1 << i
+        m = avail_mask
+        while m:
+            for i in range(n):
+                if (m >> i) & 1:
+                    rows[i].append(seqs[i][pos[i]])
+                    pos[i] += 1
+                else:
+                    rows[i].append("-")
+            yield from rec()
+            for i in range(n):
+                rows[i].pop()
+                if (m >> i) & 1:
+                    pos[i] -= 1
+            m = (m - 1) & avail_mask
+
+    yield from rec()
+
+
+def ref_pair_cost(x, y, breaking=False):
+    """Pairwise row cost: delete double-gap columns, then identical letters
+    0, different letters 1, and a maximal run of k same-side gaps k + 1
+    (switching sides restarts a run).  With breaking=True, double-gap
+    columns additionally cut runs -- used only to show that the
+    double-gap test case discriminates the two semantics."""
+    cost = 0
+    run = 0
+    side = None
+    for a, b in zip(x, y):
+        if a == "-" and b == "-":
+            if breaking and run:
+                cost += run + 1
+                run = 0
+                side = None
+            continue
+        if a != "-" and b != "-":
+            if run:
+                cost += run + 1
+                run = 0
+                side = None
+            if a != b:
+                cost += 1
+            continue
+        s = 0 if a == "-" else 1
+        if s == side:
+            run += 1
+        else:
+            if run:
+                cost += run + 1
+            run = 1
+            side = s
+    if run:
+        cost += run + 1
+    return cost
+
+
+def ref_expansion(rows):
+    """Column-major expansion of the alignment (rows in ASCII leaf order);
+    Python's string order gives "-" < "A" < "C" as required."""
+    return "".join("".join(row[k] for row in rows)
+                   for k in range(len(rows[0])))
+
+
+def ref_best_alignment(seqs, breaking=False):
+    """The (cost, columns, expansion)-minimal alignment by enumeration."""
+    best = None
+    best_rows = None
+    for rows in ref_alignments(seqs):
+        cost = sum(ref_pair_cost(rows[i], rows[j], breaking)
+                   for i in range(len(rows))
+                   for j in range(i + 1, len(rows)))
+        key = (cost, len(rows[0]), ref_expansion(rows))
+        if best is None or key < best:
+            best = key
+            best_rows = rows
+    return best_rows
+
+
+def ref_has_spanning_run(rows):
+    """True if some pair has a same-side gap run interrupted (in the raw
+    alignment) by a double-gap column."""
+    n = len(rows)
+    for i in range(n):
+        for j in range(i + 1, n):
+            rel = []
+            for k in range(len(rows[0])):
+                a, b = rows[i][k], rows[j][k]
+                if a == "-" and b == "-":
+                    rel.append("D")
+                elif a == "-":
+                    rel.append("i")
+                elif b == "-":
+                    rel.append("j")
+                else:
+                    rel.append("M")
+            for s in range(len(rel)):
+                if rel[s] not in ("i", "j"):
+                    continue
+                for t in range(s + 2, len(rel)):
+                    mid = rel[s + 1:t]
+                    if ("D" in mid and rel[t] == rel[s]
+                            and all(x in (rel[s], "D") for x in mid)):
+                        return True
+    return False
+
+
+def ref_sites_from_alignment(alignment):
+    """Per-column sites with gaps converted to "?" (all columns kept)."""
+    leaves = sorted(alignment)
+    rows = [alignment[l] for l in leaves]
+    return [{l: ("?" if r[k] == "-" else r[k])
+             for l, r in zip(leaves, rows)}
+            for k in range(len(rows[0]))]
+
+
+def sequences_payload(seq_map, edges=None, pi=None, rates=None, q=None):
+    payload = example_payload([], edges=edges, pi=pi, rates=rates, q=q)
+    del payload["sites"]
+    payload["sequences"] = seq_map
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +577,314 @@ def test_output_replaced_on_success():
               "%r -> %r" % (first, out2))
 
 
+# ---------------------------------------------------------------------------
+# Alignment import entry (sequences) tests
+# ---------------------------------------------------------------------------
+
+# Reference models: (nodes, root, edges_float, leaves, pi, a_q, b_q, rates)
+REF2 = (["R", "a", "b"], "R", [("R", "a", 0.0), ("R", "b", 1.0)],
+        ["a", "b"], [0.5, 0.5], 1.0, 1.0, [(1.0, 1.0)])
+
+EDGES3 = [["R", "u", "2/5"], ["R", "b", "7/10"], ["u", "a", "1/5"],
+          ["u", "c", "9/10"]]
+PI3 = ["2/5", "3/5"]
+Q3 = [["-3/1", "3/1"], ["2/1", "-2/1"]]
+RATES3 = [["1/2", "1/3"], ["3/2", "2/3"]]
+REF3 = (["R", "u", "a", "b", "c"], "R",
+        [("R", "u", 0.4), ("R", "b", 0.7), ("u", "a", 0.2), ("u", "c", 0.9)],
+        ["a", "b", "c"], [0.4, 0.6], 3.0, 2.0,
+        [(0.5, 1.0 / 3.0), (1.5, 2.0 / 3.0)])
+
+EDGES4 = [["R", "u", "2/5"], ["R", "v", "3/10"], ["u", "a", "1/5"],
+          ["u", "b", "7/10"], ["v", "c", "1/2"], ["v", "d", "4/5"]]
+REF4 = (["R", "u", "v", "a", "b", "c", "d"], "R",
+        [("R", "u", 0.4), ("R", "v", 0.3), ("u", "a", 0.2), ("u", "b", 0.7),
+         ("v", "c", 0.5), ("v", "d", 0.8)],
+        ["a", "b", "c", "d"], [0.4, 0.6], 3.0, 2.0,
+        [(0.5, 1.0 / 3.0), (1.5, 2.0 / 3.0)])
+
+
+def check_columns_brute(name, result, sites, ref):
+    """Verify each column's inference result against brute-force
+    enumeration over all node-state assignments."""
+    nodes, root, edges_f, leaves, pi_f, a_q, b_q, rates_f = ref
+    if not isinstance(result, list) or len(result) != len(sites):
+        return False, "result %r is not a %d-column list" % (result,
+                                                             len(sites))
+    for k, (entry, site) in enumerate(zip(result, sites)):
+        p_ev, p_v, num = brute_force_raw(nodes, root, edges_f, leaves,
+                                         pi_f, a_q, b_q, rates_f, site)
+        if p_ev == 0.0:
+            if entry != {"status": "impossible"}:
+                return False, "column %d: %r != impossible" % (k, entry)
+            continue
+        if not isinstance(entry, dict) or "likelihood" not in entry \
+                or "counts" not in entry:
+            return False, "column %d: malformed entry %r" % (k, entry)
+        if abs(entry["likelihood"] - p_ev / p_v) > 1e-8:
+            return False, "column %d likelihood %r vs %r" % (
+                k, entry["likelihood"], p_ev / p_v)
+        for e in range(len(edges_f)):
+            if abs(entry["counts"][e] - num[e] / p_ev) > 1e-6:
+                return False, "column %d edge %d count %r vs %r" % (
+                    k, e, entry["counts"][e], num[e] / p_ev)
+    return True, ""
+
+
+def run_align_case(name, payload, ref, expect=None):
+    """Run the sequences entry: the alignment must match independent
+    enumeration (and `expect` if given), and the result must match both
+    the sites entry on the derived columns and brute-force inference."""
+    with tempfile.TemporaryDirectory() as d:
+        proc, out = run_backend(payload, d)
+        if proc.returncode != 0:
+            check(name, False, "exit %d: %s" % (proc.returncode,
+                                                proc.stdout))
+            return
+        res = json.loads(out)
+        seq_map = payload["sequences"]
+        leaves_sorted = sorted(seq_map)
+        ok = set(res) == {"alignment", "result"}
+        detail = out
+        sites = None
+        if ok:
+            want_rows = ref_best_alignment([seq_map[l]
+                                            for l in leaves_sorted])
+            want = {l: r for l, r in zip(leaves_sorted, want_rows)}
+            if res["alignment"] != want:
+                ok = False
+                detail = ("alignment %r != enumeration %r"
+                          % (res["alignment"], want))
+            elif expect is not None and res["alignment"] != expect:
+                ok = False
+                detail = ("alignment %r != expected %r"
+                          % (res["alignment"], expect))
+        if ok:
+            sites = ref_sites_from_alignment(res["alignment"])
+            sites_payload = {k: v for k, v in payload.items()
+                             if k != "sequences"}
+            sites_payload["sites"] = sites
+            proc2, out2 = run_backend(sites_payload, d)
+            ok = (proc2.returncode == 0
+                  and res["result"] == json.loads(out2))
+            detail = ("result %r != sites-entry result %r"
+                      % (res["result"], out2))
+        if ok:
+            ok, detail = check_columns_brute(name, res["result"], sites,
+                                             ref)
+        check(name, ok, detail)
+
+
+def test_align_spec_example():
+    with tempfile.TemporaryDirectory() as d:
+        payload = sequences_payload({"a": "A", "b": "CA"})
+        proc, out = run_backend(payload, d)
+        res = json.loads(out) if proc.returncode == 0 else {}
+        ok = (proc.returncode == 0
+              and set(res) == {"alignment", "result"}
+              and res["alignment"] == {"a": "-A", "b": "CA"})
+        # Columns: {a: "?", b: "C"} then {a: "A", b: "A"}.
+        sites = [{"a": "?", "b": "C"}, {"a": "A", "b": "A"}]
+        proc2, out2 = run_backend(example_payload(sites), d)
+        ok = (ok and proc2.returncode == 0
+              and res["result"] == json.loads(out2))
+        ok = (ok and len(res["result"]) == 2
+              and abs(res["result"][0]["likelihood"] - 0.5) <= 1e-8
+              and res["result"][0]["counts"][0] == 0.0
+              and abs(res["result"][0]["counts"][1] - COTH1) <= 1e-8
+              and res["result"][1] == {"status": "impossible"})
+        check("align_spec_example: a=A, b=CA -> a=-A, b=CA with per-column "
+              "inference", ok, out)
+
+
+def test_align_two_leaf_enumeration():
+    cases = [
+        ("spec", {"a": "A", "b": "CA"}, {"a": "-A", "b": "CA"}),
+        # Tie: ("AA", "-A") and ("AA", "A-") both cost 2 in 2 columns;
+        # expansion "A-AA" < "AAA-" picks the former.
+        ("tie", {"a": "AA", "b": "A"}, {"a": "AA", "b": "-A"}),
+        ("tie_rev", {"a": "A", "b": "AA"}, {"a": "-A", "b": "AA"}),
+        ("one_empty", {"a": "", "b": "A"}, {"a": "-", "b": "A"}),
+        ("first_empty", {"a": "", "b": "CA"}, {"a": "--", "b": "CA"}),
+        ("both_empty", {"a": "", "b": ""}, {"a": "", "b": ""}),
+        ("mismatch", {"a": "AC", "b": "CA"}, None),
+        ("shift3", {"a": "CCA", "b": "AC"}, None),
+    ]
+    for sub, seq_map, expect in cases:
+        run_align_case("align_2leaf(%s)" % sub,
+                       sequences_payload(seq_map), REF2, expect=expect)
+
+
+def test_align_three_leaf_joint():
+    # "joint_tie": aligning c="A" against a="AC" alone would give "A-";
+    # the joint optimum (cost 7, tie broken by expansion "AC-CAA") is "-A".
+    cases = [
+        ("joint_tie", {"a": "AC", "b": "CA", "c": "A"},
+         {"a": "AC", "b": "CA", "c": "-A"}),
+        ("joint_shift", {"a": "A", "b": "CA", "c": "AC"},
+         {"a": "-A", "b": "CA", "c": "AC"}),
+        ("empty_mid", {"a": "AA", "b": "", "c": "CA"},
+         {"a": "AA", "b": "--", "c": "CA"}),
+        ("all_empty", {"a": "", "b": "", "c": ""},
+         {"a": "", "b": "", "c": ""}),
+    ]
+    for sub, seq_map, expect in cases:
+        run_align_case("align_3leaf(%s)" % sub,
+                       sequences_payload(seq_map, edges=EDGES3, pi=PI3,
+                                         rates=RATES3, q=Q3),
+                       REF3, expect=expect)
+
+
+def test_align_four_leaf_joint():
+    cases = [
+        ("joint", {"a": "AC", "b": "C", "c": "CA", "d": "A"},
+         {"a": "AC", "b": "-C", "c": "CA", "d": "-A"}),
+        ("with_empty", {"a": "AA", "b": "A", "c": "CA", "d": ""},
+         {"a": "AA", "b": "-A", "c": "CA", "d": "--"}),
+    ]
+    for sub, seq_map, expect in cases:
+        run_align_case("align_4leaf(%s)" % sub,
+                       sequences_payload(seq_map, edges=EDGES4, pi=PI3,
+                                         rates=RATES3, q=Q3),
+                       REF4, expect=expect)
+
+
+def test_align_double_gap_segment():
+    # Optimum: a="---", b="A-A", c="ACA".  For pair (a, b) the relevant
+    # columns are 1 and 3 (both gap-in-a): one run of length 2 costing 3,
+    # spanning the double-gap column 2.  If double-gap columns cut runs,
+    # the pair would cost 2+2=4 and a different alignment would win, so
+    # this case discriminates the two semantics.
+    seq_map = {"a": "", "b": "AA", "c": "ACA"}
+    seqs = [seq_map[l] for l in sorted(seq_map)]
+    rows = ref_best_alignment(seqs)
+    breaking_rows = ref_best_alignment(seqs, breaking=True)
+    ok = (rows == ("---", "A-A", "ACA")
+          and ref_has_spanning_run(rows)
+          and breaking_rows != rows)
+    check("align_double_gap: reference case spans a double-gap column and "
+          "discriminates run-breaking costs", ok,
+          "rows=%r breaking=%r" % (rows, breaking_rows))
+    run_align_case("align_double_gap: backend matches non-breaking "
+                   "enumeration",
+                   sequences_payload(seq_map, edges=EDGES3, pi=PI3,
+                                     rates=RATES3, q=Q3),
+                   REF3, expect={"a": "---", "b": "A-A", "c": "ACA"})
+
+
+def test_align_empty_and_unobservable():
+    with tempfile.TemporaryDirectory() as d:
+        payload = sequences_payload({"a": "", "b": ""})
+        proc, out = run_backend(payload, d)
+        ok = (proc.returncode == 0
+              and json.loads(out) == {"alignment": {"a": "", "b": ""},
+                                      "result": []})
+        check("align_empty: all-empty sequences -> empty rows, result []",
+              ok, out)
+    with tempfile.TemporaryDirectory() as d:
+        # Empty alignment (result []) takes precedence over unobservable.
+        payload = sequences_payload({"a": "", "b": ""},
+                                    rates=[["0/1", "1/1"]])
+        proc, out = run_backend(payload, d)
+        ok = (proc.returncode == 0
+              and json.loads(out)["result"] == [])
+        check("align_empty: [] takes precedence over unobservable", ok, out)
+    with tempfile.TemporaryDirectory() as d:
+        payload = sequences_payload({"a": "A", "b": "C"},
+                                    rates=[["0/1", "1/1"]])
+        proc, out = run_backend(payload, d)
+        res = json.loads(out) if proc.returncode == 0 else {}
+        ok = (proc.returncode == 0
+              and res == {"alignment": {"a": "A", "b": "C"},
+                          "result": {"status": "unobservable"}})
+        check("align_unobservable: alignment emitted, result keeps the "
+              "original type", ok, out)
+
+
+def test_align_rejections():
+    five_leaf_edges = [["R", "u", "1/1"], ["R", "v", "1/1"],
+                       ["u", "a", "1/1"], ["u", "b", "1/1"],
+                       ["v", "c", "1/1"], ["v", "d", "1/1"],
+                       ["R", "e", "1/1"]]
+
+    def mutated(**kw):
+        m = sequences_payload({"a": "A", "b": "CA"})
+        m.update(kw)
+        return m
+
+    no_sites = example_payload([{"a": "A", "b": "C"}])
+    del no_sites["sites"]
+
+    cases = [
+        ("five leaves",
+         mutated(edges=five_leaf_edges,
+                 sequences={"a": "A", "b": "A", "c": "A", "d": "A",
+                            "e": "A"}), "$.edges"),
+        ("sequences not object", mutated(sequences=["A", "CA"]),
+         "$.sequences"),
+        ("sequences unknown leaf",
+         mutated(sequences={"a": "A", "b": "CA", "z": "A"}), "$.sequences"),
+        ("sequences missing leaf", mutated(sequences={"a": "A"}),
+         "$.sequences"),
+        ("sequences internal node",
+         mutated(sequences={"a": "A", "R": "CA"}), "$.sequences"),
+        ("sequences bad letter",
+         mutated(sequences={"a": "A", "b": "B"}), "$.sequences.b"),
+        ("sequences gap char",
+         mutated(sequences={"a": "A", "b": "C-"}), "$.sequences.b"),
+        ("sequences missing-data char",
+         mutated(sequences={"a": "?", "b": "CA"}), "$.sequences.a"),
+        ("sequences lowercase",
+         mutated(sequences={"a": "a", "b": "CA"}), "$.sequences.a"),
+        ("sequences non-string", mutated(sequences={"a": 1, "b": "CA"}),
+         "$.sequences.a"),
+        ("sequences null", mutated(sequences={"a": None, "b": "CA"}),
+         "$.sequences.a"),
+        ("sequences duplicate member",
+         '{"edges": [["R","a","0/1"],["R","b","1/1"]],'
+         ' "pi": ["1/2","1/2"],'
+         ' "Q": [["-1/1","1/1"],["1/1","-1/1"]],'
+         ' "rates": [["1/1","1/1"]],'
+         ' "sequences": {"a": "A", "a": "C", "b": "CA"}}', "$.sequences"),
+        ("both sites and sequences",
+         mutated(sites=[{"a": "A", "b": "C"}]), "$.sequences"),
+        ("neither sites nor sequences", no_sites, "$"),
+    ]
+    for name, payload, want_path in cases:
+        with tempfile.TemporaryDirectory() as d:
+            proc, out = run_backend(payload, d, sentinel="SENTINEL")
+            ok = proc.returncode == 1 and out == "SENTINEL"
+            detail = ""
+            if ok:
+                try:
+                    err = json.loads(proc.stdout)
+                    ok = (err.get("status") == "error"
+                          and err.get("path") == want_path
+                          and err.get("index") is None
+                          and isinstance(err.get("message"), str))
+                    detail = proc.stdout.strip()
+                except (json.JSONDecodeError, AttributeError):
+                    ok = False
+                    detail = "stdout is not an error JSON: %r" % proc.stdout
+            check("align_reject: %s" % name, ok, detail)
+
+
+def test_align_output_replaced():
+    with tempfile.TemporaryDirectory() as d:
+        proc1, out1 = run_backend(sequences_payload({"a": "A", "b": "CA"}),
+                                  d, sentinel="SENTINEL")
+        ok1 = proc1.returncode == 0 and out1 != "SENTINEL"
+        # An invalid sequences input keeps the previous output file.
+        proc2, out2 = run_backend(sequences_payload({"a": "A", "b": "B"}),
+                                  d)
+        ok2 = proc2.returncode == 1 and out2 == out1
+        # The original sites entry still replaces it afterwards.
+        proc3, out3 = run_backend(example_payload([{"a": "A", "b": "C"}]), d)
+        ok3 = proc3.returncode == 0 and out3 != out1
+        check("align_output: replaced on success, kept on rejection",
+              ok1 and ok2 and ok3, "%r -> %r -> %r" % (out1, out2, out3))
+
+
 def main():
     tests = [
         test_jump_matrix_vs_quadrature,
@@ -438,6 +900,14 @@ def main():
         test_site_order,
         test_rejections,
         test_output_replaced_on_success,
+        test_align_spec_example,
+        test_align_two_leaf_enumeration,
+        test_align_three_leaf_joint,
+        test_align_four_leaf_joint,
+        test_align_double_gap_segment,
+        test_align_empty_and_unobservable,
+        test_align_rejections,
+        test_align_output_replaced,
     ]
     for t in tests:
         t()

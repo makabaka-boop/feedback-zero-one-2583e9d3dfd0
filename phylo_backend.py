@@ -39,6 +39,30 @@ Output (written to OUTPUT.json, replacing it, only on success):
                                   numerator P(E and V) is zero yield only
                                   {"status": "impossible"}
 
+Alignment import entry
+----------------------
+The same CLI also accepts an input object where "sequences" replaces "sites"
+(the two may not coexist; all other members are unchanged).  Only trees with
+2 to 4 leaves are accepted then, and "sequences" must map exactly all leaves
+to (possibly empty) A/C strings, e.g. {"a": "A", "b": "CA"}.
+
+The leaf sequences are aligned by inserting gaps "-" into equal-length rows
+(gap removal restores each original string; all-gap columns are forbidden).
+The total cost summed over all leaf pairs is minimized: per pair, columns
+where both rows show a gap are deleted first, identical letters cost 0,
+different letters 1, and a maximal run of k consecutive gaps on the same
+side costs k + 1 (switching sides starts a new run; deleted columns neither
+cost anything nor break a run).  Ties are broken by the fewest columns, then
+by the lexicographically smallest column-major expansion of the alignment
+(leaves in ASCII order per column, character order "-" < "A" < "C").
+
+The output contains exactly two members:
+  alignment : {leaf: aligned row, ...}
+  result    : the original result (same type and precision) obtained by
+              feeding every alignment column to the site inference with
+              gaps converted to "?"; all columns are kept.  When every
+              sequence is empty all rows are "" and result is [].
+
 On any invalid input (including duplicate or unknown members) the whole run
 is rejected: an error object {"status": "error", "path": <JSON path>,
 "index": <zero-based index or null>, "message": ...} is printed to stdout,
@@ -46,6 +70,7 @@ the exit code is 1 and a pre-existing OUTPUT.json is kept untouched.
 JSON syntax errors are reported with path "$".
 """
 
+import itertools
 import json
 import math
 import os
@@ -251,6 +276,29 @@ def check_sites(value, leaf_set):
     return sites
 
 
+SEQUENCE_RE = re.compile(r"[AC]*")
+
+
+def check_sequences(value, leaf_set):
+    path = "$.sequences"
+    seqs = _as_object(value, path)
+    keys = set(seqs)
+    if keys != leaf_set:
+        unknown = sorted(keys - leaf_set)
+        missing = sorted(leaf_set - keys)
+        if unknown:
+            reject(path, "unknown leaf member(s): " + ", ".join(unknown))
+        reject(path, "missing leaf member(s): " + ", ".join(missing))
+    out = {}
+    for name, seq in seqs.items():
+        if not isinstance(seq, str) or SEQUENCE_RE.fullmatch(seq) is None:
+            reject("%s.%s" % (path, name),
+                   'sequence values must be strings over "A" and "C" '
+                   "(possibly empty)")
+        out[name] = seq
+    return out
+
+
 def parse_input(text):
     def bad_constant(x):
         raise ValueError("invalid constant %s" % x)
@@ -261,7 +309,12 @@ def parse_input(text):
     except (json.JSONDecodeError, ValueError) as exc:
         reject("$", "invalid JSON syntax (%s)" % exc)
     top = _as_object(data, "$")
-    required = ("edges", "pi", "Q", "rates", "sites")
+    # "sequences" replaces "sites" for the alignment import entry; the two
+    # may not coexist (with both present, "sequences" is an unknown member
+    # of the original entry).
+    sequences_mode = "sequences" in top and "sites" not in top
+    required = ("edges", "pi", "Q", "rates",
+                "sequences" if sequences_mode else "sites")
     for key in top:
         if key not in required:
             reject("$." + key, "unknown top-level member %r" % (key,))
@@ -269,12 +322,19 @@ def parse_input(text):
         if key not in top:
             reject("$", "missing top-level member %r" % (key,))
     edges, root, leaves = check_edges(top["edges"])
+    if sequences_mode and len(leaves) > 4:
+        reject("$.edges", "the sequences entry accepts only trees with "
+                          "2 to 4 leaves")
     pi = check_pi(top["pi"])
     a_q, b_q = check_Q(top["Q"])
     rates = check_rates(top["rates"])
-    sites = check_sites(top["sites"], set(leaves))
-    return {"edges": edges, "root": root, "leaves": leaves, "pi": pi,
-            "a_q": a_q, "b_q": b_q, "rates": rates, "sites": sites}
+    model = {"edges": edges, "root": root, "leaves": leaves, "pi": pi,
+             "a_q": a_q, "b_q": b_q, "rates": rates}
+    if sequences_mode:
+        model["sequences"] = check_sequences(top["sequences"], set(leaves))
+        return "sequences", model
+    model["sites"] = check_sites(top["sites"], set(leaves))
+    return "sites", model
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +522,193 @@ def solve(edges, root, leaves, pi, a_q, b_q, rates, sites):
 
 
 # ---------------------------------------------------------------------------
+# Alignment core (sequences entry)
+# ---------------------------------------------------------------------------
+#
+# Sum-of-pairs alignment of 2-4 sequences over {A, C}.  A column is a
+# non-empty subset of the sequences contributing their next letter (the
+# other rows show "-"); all-gap columns therefore never occur and removing
+# gaps restores each original string.  The pairwise cost of two aligned
+# rows is computed after deleting the columns where both rows show a gap:
+# identical letters cost 0, different letters 1, and a maximal run of k
+# consecutive columns with the gap on the same side costs k + 1 (switching
+# sides starts a new run; deleted columns neither cost anything nor break
+# a run).  The total cost is the sum over all leaf pairs; ties are broken
+# by the fewest columns, then by the lexicographically smallest
+# column-major expansion (leaves in ASCII order, "-" < "A" < "C").
+#
+# The pairwise cost is history-dependent: a gap run stays open across
+# columns in which the pair is not involved.  The dynamic program below
+# therefore tracks, besides the consumed prefix of each sequence, the
+# total preorder of the sequences' last advancement columns: for a pair
+# (i, j) the last relevant column showed a gap in j iff i advanced more
+# recently than j.  There are only 3 / 13 / 75 total preorders on 2 / 3 /
+# 4 sequences, so an exact DAG shortest-path search over (position,
+# preorder) states is cheap for the short fragments accepted here.
+
+def _normalize_preorder(c):
+    """Canonical rank tuple of a total preorder (classes numbered 0..k-1
+    from oldest to most recent)."""
+    ranks = {v: k for k, v in enumerate(sorted(set(c)))}
+    return tuple(ranks[v] for v in c)
+
+
+def _preorder_tables(n):
+    """(preorders, initial index, transition table, gap-cost table) for
+    n sequences.  transition[c][mask] is the new preorder index after a
+    column in which exactly the sequences in `mask` advance; gapcost[c]
+    [mask] is the gap extension + opening cost of that column summed over
+    all pairs (letter mismatches are added separately)."""
+    preorders = sorted({_normalize_preorder(c)
+                        for c in itertools.product(range(n), repeat=n)})
+    index = {c: k for k, c in enumerate(preorders)}
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    trans = []
+    gapcost = []
+    for c in preorders:
+        top = max(c) + 1
+        trow = [0] * (1 << n)
+        grow = [0] * (1 << n)
+        for mask in range(1, 1 << n):
+            trow[mask] = index[_normalize_preorder(tuple(
+                top if (mask >> i) & 1 else c[i] for i in range(n)))]
+            g = 0
+            for i, j in pairs:
+                bi = (mask >> i) & 1
+                bj = (mask >> j) & 1
+                if bi == bj:
+                    continue
+                g += 1                    # one gap column for the pair
+                if bi:
+                    # Gap in j; the run continues iff i advanced strictly
+                    # more recently than j, otherwise a new run opens.
+                    if c[i] <= c[j]:
+                        g += 1
+                elif c[j] <= c[i]:        # gap in i
+                    g += 1
+            grow[mask] = g
+        trans.append(trow)
+        gapcost.append(grow)
+    return preorders, index[(0,) * n], trans, gapcost
+
+
+def align_sequences(seqs):
+    """Align the A/C strings `seqs` (given in ASCII leaf order) and return
+    the list of aligned rows (strings over "AC-") minimizing the total
+    pairwise cost, then the column count, then the column-major expansion.
+    """
+    n = len(seqs)
+    lens = tuple(len(s) for s in seqs)
+    preorders, init_ci, trans, gapcost = _preorder_tables(n)
+    npre = len(preorders)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    masks = list(range(1, 1 << n))
+    mask_bits = {m: [i for i in range(n) if (m >> i) & 1] for m in masks}
+    mask_pairs = {m: [(i, j) for (i, j) in pairs
+                      if (m >> i) & 1 and (m >> j) & 1] for m in masks}
+    # Mixed-radix encoding of the position vector.
+    base = [1] * n
+    for i in range(1, n):
+        base[i] = base[i - 1] * (lens[i - 1] + 1)
+    mask_delta = {m: sum(base[i] for i in mask_bits[m]) for m in masks}
+
+    # Backward pass over the DAG: dist[state] = best (cost, columns) to
+    # the end.  Moves strictly increase sum(pos), so decreasing-sum order
+    # is a valid reverse topological order.
+    dist = [None] * (base[-1] * (lens[-1] + 1) * npre)
+    positions = list(itertools.product(*(range(L + 1) for L in lens)))
+    positions.sort(key=sum, reverse=True)
+    full = tuple(lens)
+    for pos in positions:
+        pcode = 0
+        for i in range(n):
+            pcode += pos[i] * base[i]
+        off = pcode * npre
+        if pos == full:
+            for ci in range(npre):
+                dist[off + ci] = (0, 0)
+            continue
+        avail = [m for m in masks
+                 if all(pos[i] < lens[i] for i in mask_bits[m])]
+        nxt = [seqs[i][pos[i]] if pos[i] < lens[i] else ""
+               for i in range(n)]
+        for ci in range(npre):
+            trow = trans[ci]
+            grow = gapcost[ci]
+            best = None
+            for m in avail:
+                mc = grow[m]
+                for i, j in mask_pairs[m]:
+                    if nxt[i] != nxt[j]:
+                        mc += 1
+                dcost, dcols = dist[(pcode + mask_delta[m]) * npre
+                                    + trow[m]]
+                cand = (mc + dcost, 1 + dcols)
+                if best is None or cand < best:
+                    best = cand
+            dist[off + ci] = best
+
+    # Forward pass: among the moves that can still attain the optimum,
+    # always take the lexicographically smallest column expansion; the
+    # expansion determines the path, so this yields the smallest full
+    # expansion string.
+    opt = dist[init_ci]
+    rows = [[] for _ in range(n)]
+    pos = (0,) * n
+    pcode = 0
+    ci = init_ci
+    acc_cost = 0
+    acc_cols = 0
+    while pos != full:
+        avail = [m for m in masks
+                 if all(pos[i] < lens[i] for i in mask_bits[m])]
+        nxt = [seqs[i][pos[i]] if pos[i] < lens[i] else ""
+               for i in range(n)]
+        best_exp = None
+        best_move = None
+        for m in avail:
+            mc = gapcost[ci][m]
+            for i, j in mask_pairs[m]:
+                if nxt[i] != nxt[j]:
+                    mc += 1
+            ncode = pcode + mask_delta[m]
+            nci = trans[ci][m]
+            dcost, dcols = dist[ncode * npre + nci]
+            if (acc_cost + mc + dcost, acc_cols + 1 + dcols) != opt:
+                continue
+            exp = "".join(nxt[i] if (m >> i) & 1 else "-"
+                          for i in range(n))
+            if best_exp is None or exp < best_exp:
+                best_exp = exp
+                best_move = (m, mc, ncode, nci)
+        m, mc, pcode, ci = best_move
+        for i in range(n):
+            rows[i].append(nxt[i] if (m >> i) & 1 else "-")
+        acc_cost += mc
+        acc_cols += 1
+        pos = tuple(pos[i] + ((m >> i) & 1) for i in range(n))
+    return ["".join(row) for row in rows]
+
+
+def run_sequences_entry(model):
+    """Alignment import entry: align the leaf sequences, then run the
+    original site inference on every column with gaps converted to "?"."""
+    leaves = model["leaves"]
+    seqs = [model["sequences"][leaf] for leaf in leaves]
+    rows = align_sequences(seqs)
+    alignment = {leaf: row for leaf, row in zip(leaves, rows)}
+    sites = []
+    for k in range(len(rows[0])):
+        site = {}
+        for leaf, row in zip(leaves, rows):
+            site[leaf] = "?" if row[k] == "-" else row[k]
+        sites.append(site)
+    result = solve(model["edges"], model["root"], leaves, model["pi"],
+                   model["a_q"], model["b_q"], model["rates"], sites)
+    return {"alignment": alignment, "result": result}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -484,8 +731,11 @@ def main(argv):
         report_error("$", "cannot read input file: %s" % exc)
         return 1
     try:
-        model = parse_input(text)
-        result = solve(**model)
+        mode, model = parse_input(text)
+        if mode == "sequences":
+            result = run_sequences_entry(model)
+        else:
+            result = solve(**model)
     except Reject as rj:
         report_error(rj.path, rj.message, rj.index)
         return 1
